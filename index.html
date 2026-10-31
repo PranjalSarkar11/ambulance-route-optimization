@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tezpur Ambulance Route Optimizer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  <style>
+    :root { --bg:#0b1220; --panel:#111c2e; --panel2:#17243a; --text:#e8eef8; --muted:#9aabc2; --accent:#42b6a5; --red:#ff5d68; --line:#2a3a52; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Inter,Segoe UI,Arial,sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    h1 { margin:0; font-size:20px; letter-spacing:.2px; }
+    .sub { color:var(--muted); font-size:12px; margin-top:5px; }
+    .layout { display:grid; grid-template-columns:320px 1fr; min-height:calc(100vh - 76px); }
+    aside { background:var(--panel); border-right:1px solid var(--line); padding:18px; overflow:auto; }
+    #map { height:calc(100vh - 76px); min-height:560px; background:#dce5e8; }
+    .card { background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:13px; margin-bottom:13px; }
+    .label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.09em; }
+    .value { font-size:22px; font-weight:700; margin-top:5px; }
+    .small { font-size:12px; color:var(--muted); line-height:1.5; }
+    button, select { width:100%; border:1px solid #40536f; border-radius:8px; background:#20314b; color:var(--text); padding:10px; margin-top:8px; cursor:pointer; }
+    button:hover { background:#2a4162; }
+    button.primary { background:#087f73; border-color:#119d8e; }
+    .legend { display:grid; grid-template-columns:1fr 1fr; gap:9px; font-size:12px; color:var(--muted); }
+    .swatch { display:inline-block; width:20px; height:4px; margin-right:7px; vertical-align:middle; border-radius:5px; }
+    .status { padding:9px 10px; border-radius:8px; background:#102e2b; color:#8de0d2; font-size:12px; line-height:1.45; }
+    .leaflet-popup-content { color:#142033; }
+    .marker-emoji { font-size:24px; line-height:30px; text-align:center; }
+    @media (max-width:850px) { .layout { grid-template-columns:1fr; } aside { order:2; } #map { height:65vh; min-height:430px; } }
+  </style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>🚑 Tezpur Ambulance Route Optimizer</h1>
+    <div class="sub">OpenStreetMap road network · Kanaklata Civil Hospital · Dijkstra shortest-path model</div>
+  </div>
+  <div class="small">Academic simulation — not a live emergency dispatch service</div>
+</header>
+<div class="layout">
+  <aside>
+    <div class="card">
+      <div class="label">Network overview</div>
+      <div class="value" id="nodeCount">—</div><div class="small">road-network nodes</div>
+      <div class="value" id="edgeCount">—</div><div class="small">directed road segments</div>
+    </div>
+    <div class="card">
+      <div class="label">Route estimate</div>
+      <div class="value" id="timeValue">—</div><div class="small">estimated travel time (minutes)</div>
+      <p class="small" id="routeInfo">Load the project graph data to view a route.</p>
+    </div>
+    <div class="card">
+      <div class="label">Starting road node</div>
+      <select id="startSelect"><option value="">Choose a start node</option></select>
+      <button class="primary" id="routeBtn">Calculate shortest route</button>
+      <button id="animateBtn">▶ Animate ambulance</button>
+      <button id="resetBtn">Reset map view</button>
+    </div>
+    <div class="card">
+      <div class="label">Map legend</div>
+      <div class="legend">
+        <div><span class="swatch" style="background:#8996a8"></span>Road network</div>
+        <div><span class="swatch" style="background:#ef4352"></span>Chosen route</div>
+        <div>🚑 Ambulance</div><div>🏥 Hospital</div>
+      </div>
+    </div>
+    <div class="status" id="status">Waiting for road_network.json. Generate it from your Python project, then serve this folder locally.</div>
+    <p class="small" style="margin-top:14px">Road times are estimates based on assumed speeds. OSM data does not provide verified live traffic or ambulance ETAs. The hospital marker is its mapped location; the route ends at the nearest selected road node.</p>
+    <p class="small">Map data © OpenStreetMap contributors.</p>
+  </aside>
+  <main><div id="map"></div></main>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+ integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+const map = L.map('map').setView([26.628821, 92.796941], 16);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 20, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+}).addTo(map);
+
+let data = null, roadLayers = [], routeLayer = null, hospitalMarker = null, ambulanceMarker = null, startMarker = null, animationTimer = null;
+const nodeById = new Map();
+const statusEl = document.getElementById('status');
+
+function iconEmoji(emoji) {
+  return L.divIcon({className:'', html:`<div class="marker-emoji">${emoji}</div>`, iconSize:[30,34], iconAnchor:[15,17]});
+}
+function clearRoute() {
+  if (routeLayer) map.removeLayer(routeLayer);
+  if (startMarker) map.removeLayer(startMarker);
+  if (ambulanceMarker) map.removeLayer(ambulanceMarker);
+  if (animationTimer) clearInterval(animationTimer);
+  routeLayer = startMarker = ambulanceMarker = null;
+}
+function drawRoute(route, time) {
+  clearRoute();
+  const coords = route.map(id => {
+    const n = nodeById.get(String(id));
+    return n ? [n.lat, n.lon] : null;
+  }).filter(Boolean);
+  if (!coords.length) { statusEl.textContent = 'Route nodes were not found in the exported graph.'; return; }
+  routeLayer = L.polyline(coords, {color:'#ef4352', weight:6, opacity:.95}).addTo(map);
+  const first = coords[0];
+  startMarker = L.marker(first).addTo(map).bindPopup('Ambulance starting point');
+  ambulanceMarker = L.marker(first, {icon:iconEmoji('🚑'), zIndexOffset:1000}).addTo(map);
+  map.fitBounds(routeLayer.getBounds(), {padding:[35,35]});
+  document.getElementById('timeValue').textContent = Number(time).toFixed(3);
+  document.getElementById('routeInfo').textContent = `${route.length - 1} road segments · ${route.length} graph nodes`;
+  statusEl.textContent = 'Shortest route displayed. The red line is the Dijkstra route in your exported graph.';
+}
+function dijkstra(start, destination) {
+  // Browser-side Dijkstra, supporting parallel edges.
+  const dist = new Map(), prev = new Map(), visited = new Set();
+  for (const n of data.nodes) dist.set(String(n.id), Infinity);
+  dist.set(String(start), 0);
+  const adjacency = new Map();
+  for (const e of data.edges) {
+    const a = String(e.source), b = String(e.target), w = Number(e.travel_time_min);
+    if (!adjacency.has(a)) adjacency.set(a, []);
+    adjacency.get(a).push([b, w]);
+  }
+  while (true) {
+    let u = null, best = Infinity;
+    for (const [id, d] of dist) if (!visited.has(id) && d < best) { best=d; u=id; }
+    if (u === null || u === String(destination)) break;
+    visited.add(u);
+    for (const [v,w] of (adjacency.get(u) || [])) {
+      const alt = best + w;
+      if (alt < (dist.get(v) ?? Infinity)) { dist.set(v,alt); prev.set(v,u); }
+    }
+  }
+  const end = String(destination);
+  if (!Number.isFinite(dist.get(end))) return null;
+  const path=[end]; let cur=end;
+  while (cur !== String(start)) { cur=prev.get(cur); if (!cur) return null; path.push(cur); }
+  path.reverse();
+  return {path, time:dist.get(end)};
+}
+function routeFromSelection() {
+  const start = document.getElementById('startSelect').value;
+  if (!start) { statusEl.textContent='Choose a starting node first.'; return; }
+  const result = dijkstra(start, data.hospital_access_node);
+  if (!result) { statusEl.textContent='No route found between these nodes.'; return; }
+  drawRoute(result.path, result.time);
+}
+function animateAmbulance() {
+  if (!routeLayer) { statusEl.textContent='Calculate a route before starting the animation.'; return; }
+  if (animationTimer) clearInterval(animationTimer);
+  const points=routeLayer.getLatLngs(); let i=0;
+  if (ambulanceMarker) map.removeLayer(ambulanceMarker);
+  ambulanceMarker=L.marker(points[0], {icon:iconEmoji('🚑'), zIndexOffset:1000}).addTo(map);
+  animationTimer=setInterval(() => {
+    i++;
+    if (i >= points.length) { clearInterval(animationTimer); animationTimer=null; statusEl.textContent='Ambulance animation reached the hospital access node.'; return; }
+    ambulanceMarker.setLatLng(points[i]);
+  }, 650);
+}
+async function loadData() {
+  try {
+    const response = await fetch('./output/road_network.json');
+    if (!response.ok) throw new Error('road_network.json not found');
+    data=await response.json();
+    for (const n of data.nodes) nodeById.set(String(n.id), n);
+    document.getElementById('nodeCount').textContent=data.nodes.length;
+    document.getElementById('edgeCount').textContent=data.edges.length;
+    // Draw each directed segment as a map line.
+    for (const e of data.edges) {
+      const a=nodeById.get(String(e.source)), b=nodeById.get(String(e.target));
+      if (!a || !b) continue;
+      const line=L.polyline([[a.lat,a.lon],[b.lat,b.lon]], {color:'#8996a8',weight:2,opacity:.7}).addTo(map);
+      roadLayers.push(line);
+    }
+    const h=data.hospital;
+    hospitalMarker=L.marker([h.lat,h.lon], {icon:iconEmoji('🏥'), zIndexOffset:900}).addTo(map)
+      .bindPopup(`<b>${h.name}</b><br>Mapped hospital location`);
+    const select=document.getElementById('startSelect');
+    for (const id of (data.suggested_start_nodes || data.nodes.slice(0,10).map(n=>n.id))) {
+      const n=nodeById.get(String(id)); if (!n) continue;
+      const option=document.createElement('option'); option.value=id; option.textContent=String(id); select.appendChild(option);
+    }
+    if (data.default_start_node && nodeById.has(String(data.default_start_node))) select.value=String(data.default_start_node);
+    if (data.default_route && data.default_route.length) drawRoute(data.default_route, data.default_route_time_min || 0);
+    else statusEl.textContent='Road graph loaded. Choose a start node and calculate a route.';
+    map.setView([h.lat,h.lon],16);
+  } catch(err) {
+    statusEl.textContent='Could not load road_network.json. Follow the export instructions in README.txt, then run a local web server. ('+err.message+')';
+  }
+}
+document.getElementById('routeBtn').addEventListener('click',routeFromSelection);
+document.getElementById('animateBtn').addEventListener('click',animateAmbulance);
+document.getElementById('resetBtn').addEventListener('click',()=>{ if(data) map.setView([data.hospital.lat,data.hospital.lon],16); });
+loadData();
+</script>
+</body>
+</html>
